@@ -13,12 +13,26 @@ import { Switch } from "@ethui/ui/components/shadcn/switch";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { CheckCircle, Database, GitFork, Layers, Loader2, Wallet } from "lucide-react";
+import {
+  CheckCircle,
+  Database,
+  GitFork,
+  Layers,
+  Loader2,
+  Settings2,
+  Wallet,
+} from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "react-hot-toast";
 import { z } from "zod";
-import { createStackInputSchema, stacks } from "~/api/stacks";
+import {
+  type AnvilOpts,
+  anvilOptsSchema,
+  apiErrorMessage,
+  createStackInputSchema,
+  stacks,
+} from "~/api/stacks";
 import { BackButton } from "~/components/BackButton";
 import { DefaultAddresses } from "~/components/DefaultAddresses";
 import { StackProvider } from "~/components/StackProvider";
@@ -28,19 +42,90 @@ export const Route = createFileRoute("/_authenticated/dashboard/new")({
   component: NewStackPage,
 });
 
-const stackFormSchema = z.object({
-  slug: z
-    .string()
-    .min(1, "Stack name is required")
-    .regex(
-      /^[a-z][a-z0-9-]*$/,
-      "Must start with a letter and contain only lowercase letters, numbers, and hyphens",
-    ),
-  forkUrl: z.string().optional(),
-  forkBlockNumber: z.number().optional(),
+const advancedSchema = anvilOptsSchema.omit({
+  fork_url: true,
+  fork_block_number: true,
 });
 
+/** Mirrors validate_anvil_opts_conflicts/1 in server/lib/ethui/stacks/stack.ex. */
+function miningConflicts(opts: Partial<AnvilOpts>): string[] {
+  const messages = [];
+
+  if (opts.mixed_mining && !opts.block_time) {
+    messages.push("Mixed mining requires a block time.");
+  }
+
+  if (opts.no_mining && (opts.block_time || opts.mixed_mining)) {
+    messages.push(
+      "Mine on demand cannot be combined with block time or mixed mining.",
+    );
+  }
+
+  return messages;
+}
+
+const stackFormSchema = z
+  .object({
+    slug: z
+      .string()
+      .min(1, "Stack name is required")
+      .regex(
+        /^[a-z][a-z0-9-]*$/,
+        "Must start with a letter and contain only lowercase letters, numbers, and hyphens",
+      ),
+    forkUrl: z.string().optional(),
+    forkBlockNumber: z.number().optional(),
+    advanced: advancedSchema,
+  })
+  .superRefine((data, ctx) => {
+    for (const message of miningConflicts(data.advanced)) {
+      ctx.addIssue({ code: "custom", path: ["advanced"], message });
+    }
+  });
+
 type StackFormData = z.infer<typeof stackFormSchema>;
+
+const ADVANCED_NUMBERS = [
+  { name: "accounts", label: "Dev Accounts", placeholder: "10" },
+  { name: "balance", label: "Account Balance (ETH)", placeholder: "10000" },
+  { name: "block_time", label: "Block Time (s)", placeholder: "On demand" },
+  { name: "slots_in_an_epoch", label: "Slots in an Epoch", placeholder: "32" },
+  {
+    name: "state_interval",
+    label: "State Dump Interval (s)",
+    placeholder: "On exit",
+  },
+  {
+    name: "transaction_block_keeper",
+    label: "Blocks Kept in Memory",
+    placeholder: "Unlimited",
+  },
+  { name: "gas_limit", label: "Block Gas Limit", placeholder: "Default" },
+  { name: "gas_price", label: "Gas Price (wei)", placeholder: "Default" },
+  {
+    name: "block_base_fee_per_gas",
+    label: "Base Fee (wei)",
+    placeholder: "Default",
+  },
+  {
+    name: "code_size_limit",
+    label: "Code Size Limit (bytes)",
+    placeholder: "24576",
+  },
+] as const satisfies readonly {
+  name: keyof AnvilOpts;
+  label: string;
+  placeholder: string;
+}[];
+
+const ADVANCED_FLAGS = [
+  { name: "mixed_mining", label: "Mixed mining (timer + on submit)" },
+  { name: "no_mining", label: "Mine on demand only" },
+  { name: "prune_history", label: "Prune history (nothing persisted to disk)" },
+  { name: "disable_block_gas_limit", label: "Disable block gas limit" },
+  { name: "disable_code_size_limit", label: "Disable code size limit" },
+  { name: "auto_impersonate", label: "Auto-impersonate any sender" },
+] as const satisfies readonly { name: keyof AnvilOpts; label: string }[];
 
 const PRESET_NETWORKS = [
   {
@@ -59,6 +144,7 @@ function NewStackPage() {
   const queryClient = useQueryClient();
   const [enableFork, setEnableFork] = useState(false);
   const [enableGraph, setEnableGraph] = useState(false);
+  const [enableAdvanced, setEnableAdvanced] = useState(false);
   const [createdSlug, setCreatedSlug] = useState<string | null>(null);
 
   const { data: createdStack } = useGetStack(createdSlug ?? "", {
@@ -72,6 +158,9 @@ function NewStackPage() {
       slug: "",
       forkUrl: "",
       forkBlockNumber: undefined,
+      advanced: Object.fromEntries(
+        ADVANCED_FLAGS.map(({ name }) => [name, false]),
+      ),
     },
   });
 
@@ -82,23 +171,29 @@ function NewStackPage() {
       toast.success("Stack created successfully");
       setCreatedSlug(variables.slug);
     },
-    onError: () => {
-      toast.error("Failed to create stack");
+    onError: (error) => {
+      toast.error(apiErrorMessage(error, "Failed to create stack"));
     },
   });
 
   const currentForkUrl = form.watch("forkUrl");
 
+  // Read from the live values, not formState.errors: with mode "onChange" RHF
+  // only keeps issues whose path is the field that just changed, so a
+  // cross-field issue never survives long enough to render.
+  const advancedConflicts = miningConflicts(form.watch("advanced"));
+
   const handleSubmit = (data: StackFormData) => {
+    const anvilOpts: AnvilOpts = {
+      ...(enableFork && data.forkUrl
+        ? { fork_url: data.forkUrl, fork_block_number: data.forkBlockNumber }
+        : {}),
+      ...(enableAdvanced ? prune(data.advanced) : {}),
+    };
+
     const input = createStackInputSchema.parse({
       slug: data.slug,
-      anvil_opts:
-        enableFork && data.forkUrl
-          ? {
-              fork_url: data.forkUrl,
-              fork_block_number: data.forkBlockNumber,
-            }
-          : undefined,
+      anvil_opts: Object.keys(anvilOpts).length ? anvilOpts : undefined,
       graph_opts: enableGraph ? { enabled: true } : undefined,
     });
 
@@ -247,6 +342,53 @@ function NewStackPage() {
 
               <Separator />
 
+              <ToggleSection
+                icon={Settings2}
+                title="Advanced Anvil Options"
+                description="Mining, finality, history and EVM limits"
+                enabled={enableAdvanced}
+                onToggle={setEnableAdvanced}
+              >
+                <div className="ml-12 space-y-4 rounded-lg border border-border bg-muted/50 p-4">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    {ADVANCED_NUMBERS.map(({ name, label, placeholder }) => (
+                      <Form.NumberField
+                        key={name}
+                        name={`advanced.${name}`}
+                        label={label}
+                        placeholder={placeholder}
+                        className="w-full"
+                      />
+                    ))}
+                  </div>
+
+                  <div className="space-y-2">
+                    {ADVANCED_FLAGS.map(({ name, label }) => (
+                      <Form.Checkbox
+                        key={name}
+                        name={`advanced.${name}`}
+                        label={label}
+                      />
+                    ))}
+                  </div>
+
+                  {advancedConflicts.length > 0 && (
+                    <ul className="space-y-1 text-destructive text-xs">
+                      {advancedConflicts.map((message) => (
+                        <li key={message}>{message}</li>
+                      ))}
+                    </ul>
+                  )}
+
+                  <p className="text-muted-foreground text-xs">
+                    Host, port, chain ID and the state file stay managed by
+                    stacks and can't be overridden.
+                  </p>
+                </div>
+              </ToggleSection>
+
+              <Separator />
+
               <div className="flex gap-3 pt-2">
                 <Button
                   type="button"
@@ -268,6 +410,17 @@ function NewStackPage() {
         </Card>
       </div>
     </div>
+  );
+}
+
+/** Empty number inputs and unchecked boxes must not become anvil flags. */
+function prune(opts: AnvilOpts): AnvilOpts {
+  return Object.fromEntries(
+    Object.entries(opts).filter(([, value]) => {
+      if (value === undefined || value === null || value === "") return false;
+      if (typeof value === "number") return !Number.isNaN(value);
+      return value !== false;
+    }),
   );
 }
 

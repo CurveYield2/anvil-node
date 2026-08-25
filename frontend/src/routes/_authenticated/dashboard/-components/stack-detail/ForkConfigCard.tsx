@@ -22,7 +22,7 @@ export function ForkConfigCard({ stack }: ForkConfigCardProps) {
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        {stack.anvil_opts ? (
+        {stack.anvil_opts?.fork_url ? (
           <>
             <DetailRow
               label="Fork URL"

@@ -266,12 +266,24 @@ defmodule Ethui.Services.Anvil do
 
   defp opts_to_args(opts) when is_map(opts) do
     opts
-    |> Enum.flat_map(fn {key, val} ->
-      ["--" <> dashify(key), to_string(val)]
+    |> Enum.sort()
+    |> Enum.flat_map(fn
+      {_key, false} -> []
+      {key, true} -> ["--" <> dashify(key)]
+      {key, val} -> ["--" <> dashify(key), to_string(val)]
     end)
   end
 
   defp dashify(key) when is_binary(key), do: String.replace(key, "_", "-")
+
+  # Without --preserve-historical-states, every suspend/resume cycle silently drops
+  # pre-restart state: blocks and logs survive, but eth_call at any older block fails
+  # with BlockOutOfRangeError, which breaks indexers replaying chain history.
+  # --prune-history forces max_persisted_states to 0, so the two together are
+  # contradictory rather than an error; anvil boots and persists nothing.
+  defp history_args(args) do
+    if "--prune-history" in args, do: [], else: ["--preserve-historical-states"]
+  end
 
   defp touch(state) do
     timer =
@@ -320,21 +332,20 @@ defmodule Ethui.Services.Anvil do
 
     pid = self()
 
+    # Caller args go first so the server-managed ones win any duplicate: clap
+    # takes the last occurrence of a flag.
     anvil_args =
-      [
-        "--port",
-        to_string(port),
-        "--state",
-        "#{dir}/state.json",
-        # Without this, every suspend/resume cycle silently drops pre-restart state:
-        # blocks and logs survive, but eth_call at any older block fails with
-        # BlockOutOfRangeError, which breaks indexers replaying chain history.
-        "--preserve-historical-states",
-        "--host",
-        "0.0.0.0",
-        "--chain-id",
-        to_string(chain_id)
-      ] ++ args
+      args ++
+        [
+          "--port",
+          to_string(port),
+          "--state",
+          "#{dir}/state.json",
+          "--host",
+          "0.0.0.0",
+          "--chain-id",
+          to_string(chain_id)
+        ] ++ history_args(args)
 
     with {:ok, proc} <-
            MuonTrap.Daemon.start_link(

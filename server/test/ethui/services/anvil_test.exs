@@ -76,6 +76,36 @@ defmodule Ethui.Services.AnvilTest do
     assert {:error, %{reason: :econnrefused}} = err
   end
 
+  test "boots with mining, finality and history options" do
+    {:ok, anvil} =
+      Anvil.start_link(
+        ports: HttpPorts,
+        slug: "opts456",
+        hash: "hash",
+        anvil_opts: %{
+          "accounts" => 15,
+          "disable_block_gas_limit" => true,
+          "slots_in_an_epoch" => 2,
+          "block_time" => 12,
+          "mixed_mining" => true,
+          "state_interval" => 60,
+          "transaction_block_keeper" => 20_000
+        },
+        id: 1
+      )
+
+    Anvil.ensure_running(anvil)
+
+    client = Rpc.new_client(:http, rpc_url: Anvil.url(anvil))
+
+    {:ok, %Exth.Rpc.Response.Success{result: accounts}} =
+      Rpc.request("eth_accounts", []) |> Rpc.send(client)
+
+    assert length(accounts) == 15
+
+    Anvil.destroy(anvil)
+  end
+
   test "creates multiple anvil processes" do
     anvils =
       for i <- 1..10 do
