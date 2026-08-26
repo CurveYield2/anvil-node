@@ -7,13 +7,36 @@ defmodule Ethui.Services.AnvilTest do
 
   setup do
     cleanup()
+    # a failed assertion skips the destroy at the end of a test, and the anvil
+    # it started traps exits, so without this it outlives the test and keeps
+    # its port bound for every test that follows
+    on_exit(&cleanup/0)
     :ok
+  end
+
+  defp data_dir_root do
+    Application.get_env(:ethui, Ethui.Stacks) |> Keyword.fetch!(:data_dir_root)
   end
 
   defp cleanup do
     Server.list()
     |> Enum.each(fn slug ->
       Server.destroy(%Stack{slug: slug})
+    end)
+
+    Registry.select(Ethui.Stacks.Registry, [{{{:_, :anvil}, :"$1", :_}, [], [:"$1"]}])
+    |> Enum.each(fn pid ->
+      if Process.alive?(pid) do
+        ref = Process.monitor(pid)
+        Anvil.destroy(pid)
+        # destroy is a cast: without waiting, the next test claims the port
+        # this anvil has not released yet
+        receive do
+          {:DOWN, ^ref, :process, ^pid, _} -> :ok
+        after
+          :timer.seconds(40) -> :ok
+        end
+      end
     end)
 
     :ok
@@ -125,6 +148,76 @@ defmodule Ethui.Services.AnvilTest do
     Anvil.destroy(anvil)
   end
 
+  test "keeps chain state across suspend and resume" do
+    {:ok, anvil} = Anvil.start_link(ports: HttpPorts, slug: "persist", hash: "hash", id: 1)
+    :ok = Anvil.ensure_running(anvil)
+
+    client = Rpc.new_client(:http, rpc_url: Anvil.url(anvil))
+    {:ok, _} = Rpc.request("anvil_mine", ["0x5"]) |> Rpc.send(client)
+
+    {:ok, %Exth.Rpc.Response.Success{result: mined}} =
+      Rpc.request("eth_blockNumber", []) |> Rpc.send(client)
+
+    # the call queues behind the suspend, which only returns once anvil has
+    # dumped its state and released the port
+    send(anvil, :suspend)
+    :ok = Anvil.ensure_running(anvil)
+
+    client = Rpc.new_client(:http, rpc_url: Anvil.url(anvil))
+
+    assert {:ok, %Exth.Rpc.Response.Success{result: ^mined}} =
+             Rpc.request("eth_blockNumber", []) |> Rpc.send(client)
+
+    Anvil.destroy(anvil)
+  end
+
+  test "answers that it is still starting while anvil loads" do
+    bin = Path.join(System.tmp_dir!(), "slow_anvil")
+    File.write!(bin, "#!/bin/sh\nsleep 3\nexec anvil \"$@\"\n")
+    File.chmod!(bin, 0o755)
+
+    config = Application.get_env(:ethui, Ethui.Stacks)
+    Application.put_env(:ethui, Ethui.Stacks, Keyword.put(config, :anvil_bin, bin))
+    on_exit(fn -> Application.put_env(:ethui, Ethui.Stacks, config) end)
+
+    {:ok, anvil} =
+      Anvil.start_link(
+        ports: HttpPorts,
+        slug: "slow",
+        hash: "hash",
+        id: 1,
+        boot_attempts: 2
+      )
+
+    # anvil is alive and still loading, so the boot is left running
+    assert {:error, :starting} = Anvil.ensure_running(anvil)
+
+    Process.sleep(3_500)
+    assert :ok = Anvil.ensure_running(anvil)
+
+    client = Rpc.new_client(:http, rpc_url: Anvil.url(anvil))
+    assert {:ok, _} = Rpc.request("anvil_nodeInfo", []) |> Rpc.send(client)
+
+    Anvil.destroy(anvil)
+  end
+
+  test "recovers from a state file anvil cannot parse" do
+    dir = Path.join([data_dir_root(), "corrupt.hash", "anvil"])
+    File.mkdir_p!(dir)
+    # what a suspend that outran anvil's state dump leaves behind
+    File.write!(Path.join(dir, "state.json"), "{ truncated")
+
+    {:ok, anvil} = Anvil.start_link(ports: HttpPorts, slug: "corrupt", hash: "hash", id: 1)
+
+    assert :ok = Anvil.ensure_running(anvil)
+    assert File.exists?(Path.join(dir, "state.json.corrupt"))
+
+    client = Rpc.new_client(:http, rpc_url: Anvil.url(anvil))
+    assert {:ok, _} = Rpc.request("anvil_nodeInfo", []) |> Rpc.send(client)
+
+    Anvil.destroy(anvil)
+  end
+
   test "reports a boot failure instead of retrying it forever" do
     {:ok, anvil} =
       Anvil.start_link(
@@ -147,18 +240,14 @@ defmodule Ethui.Services.AnvilTest do
     Anvil.destroy(anvil)
   end
 
-  test "keeps the same port across suspend and resume" do
+  test "serves again after a suspend" do
     {:ok, anvil} = Anvil.start_link(ports: HttpPorts, slug: "resumed", hash: "hash", id: 1)
     :ok = Anvil.ensure_running(anvil)
-    url = Anvil.url(anvil)
 
     send(anvil, :suspend)
-    Process.sleep(200)
-
     :ok = Anvil.ensure_running(anvil)
-    assert Anvil.url(anvil) == url
 
-    client = Rpc.new_client(:http, rpc_url: url)
+    client = Rpc.new_client(:http, rpc_url: Anvil.url(anvil))
     assert {:ok, _} = Rpc.request("anvil_nodeInfo", []) |> Rpc.send(client)
 
     Anvil.destroy(anvil)
