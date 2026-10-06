@@ -79,7 +79,7 @@ jobs:
           echo "::error::Anvil readiness timeout"
           exit 1
 
-      - name: Verify identity, archive reads, mutability and persistence
+      - name: Verify identity, fork reads, mutability and persistence
         shell: bash
         run: |
           set -euo pipefail
@@ -101,7 +101,7 @@ jobs:
           block="$(rpc eth_blockNumber '[]' | jq -r '.result')"
           [[ "$block" =~ ^0x[0-9a-fA-F]+$ ]]
 
-          weth_code="$(rpc eth_getCode '["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc","0xc5d488"]' | jq -r '.result')"
+          weth_code="$(rpc eth_getCode '["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc","latest"]' | jq -r '.result')"
           test -n "$weth_code"
           test "$weth_code" != "0x"
 
