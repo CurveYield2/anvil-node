@@ -1,0 +1,93 @@
+x-anvil-environment: &anvil-environment
+  ETHEREUM_SOURCE_RPC_URL: ${ETHEREUM_SOURCE_RPC_URL:?ETHEREUM_SOURCE_RPC_URL is required}
+  ANVIL_CHAIN_ID: "1"
+  ANVIL_PORT: "8545"
+  ANVIL_ACCOUNTS: "20"
+  ANVIL_STATE_PATH: "/data/state.json"
+
+x-anvil-service: &anvil-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  expose:
+    - "8545"
+  stop_grace_period: 45s
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/curveyield-anvil-healthcheck"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 300s
+
+services:
+  anvil-01:
+    <<: *anvil-service
+    environment:
+      <<: *anvil-environment
+      ANVIL_NODE_ID: ethereum-01
+    ports:
+      - "127.0.0.1:18545:8545"
+    volumes:
+      - anvil_01_state:/data
+
+  anvil-02:
+    <<: *anvil-service
+    environment:
+      <<: *anvil-environment
+      ANVIL_NODE_ID: ethereum-02
+    ports:
+      - "127.0.0.1:18546:8545"
+    volumes:
+      - anvil_02_state:/data
+
+  anvil-03:
+    <<: *anvil-service
+    environment:
+      <<: *anvil-environment
+      ANVIL_NODE_ID: ethereum-03
+    ports:
+      - "127.0.0.1:18547:8545"
+    volumes:
+      - anvil_03_state:/data
+
+  anvil-04:
+    <<: *anvil-service
+    environment:
+      <<: *anvil-environment
+      ANVIL_NODE_ID: ethereum-04
+    ports:
+      - "127.0.0.1:18548:8545"
+    volumes:
+      - anvil_04_state:/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      anvil-01:
+        condition: service_healthy
+      anvil-02:
+        condition: service_healthy
+      anvil-03:
+        condition: service_healthy
+      anvil-04:
+        condition: service_healthy
+    environment:
+      RPC_DOMAIN: ${RPC_DOMAIN:?RPC_DOMAIN is required}
+      RPC_PATH_TOKEN: ${RPC_PATH_TOKEN:?RPC_PATH_TOKEN is required}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  anvil_01_state:
+  anvil_02_state:
+  anvil_03_state:
+  anvil_04_state:
+  caddy_data:
+  caddy_config:

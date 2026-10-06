@@ -1,0 +1,43 @@
+{$RPC_DOMAIN} {
+	handle_path /{$RPC_PATH_TOKEN}/ethereum-01 {
+		reverse_proxy anvil-01:8545 {
+			transport http {
+				dial_timeout 30s
+				read_timeout 10m
+				write_timeout 10m
+			}
+		}
+	}
+
+	handle_path /{$RPC_PATH_TOKEN}/ethereum-02 {
+		reverse_proxy anvil-02:8545 {
+			transport http {
+				dial_timeout 30s
+				read_timeout 10m
+				write_timeout 10m
+			}
+		}
+	}
+
+	handle_path /{$RPC_PATH_TOKEN}/ethereum-03 {
+		reverse_proxy anvil-03:8545 {
+			transport http {
+				dial_timeout 30s
+				read_timeout 10m
+				write_timeout 10m
+			}
+		}
+	}
+
+	handle_path /{$RPC_PATH_TOKEN}/ethereum-04 {
+		reverse_proxy anvil-04:8545 {
+			transport http {
+				dial_timeout 30s
+				read_timeout 10m
+				write_timeout 10m
+			}
+		}
+	}
+
+	respond 404
+}

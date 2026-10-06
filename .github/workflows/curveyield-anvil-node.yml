@@ -1,0 +1,391 @@
+name: CurveYield Anvil Node
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'curveyield-anvil/**'
+      - '.github/workflows/curveyield-anvil-node.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: curveyield-anvil-node-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QUALIFICATION_SOURCE_RPC: https://eth.drpc.org/
+  QUALIFICATION_RPC_DOMAIN: rpc.example.invalid
+  QUALIFICATION_RPC_PATH_TOKEN: qualification-only-token
+  COMPOSE_PROJECT_NAME: curveyield-anvil-qualification
+
+jobs:
+  qualify:
+    name: Qualify fixed persistent Anvil fleet
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout Contract-Automation probes
+        uses: actions/checkout@v4
+        with:
+          repository: CurveYield2/Contract-Automation
+          ref: main
+          path: .contract-automation
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate Compose
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ env.QUALIFICATION_SOURCE_RPC }}
+          RPC_DOMAIN: ${{ env.QUALIFICATION_RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ env.QUALIFICATION_RPC_PATH_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker compose -f curveyield-anvil/compose.yml config >/tmp/curveyield-anvil-compose.yml
+          for service in anvil-01 anvil-02 anvil-03 anvil-04; do
+            grep -q "$service:" /tmp/curveyield-anvil-compose.yml
+          done
+
+      - name: Build pinned minimal Anvil image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t curveyield-anvil:qualification curveyield-anvil
+
+      - name: Start four-node qualification fleet
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ env.QUALIFICATION_SOURCE_RPC }}
+          RPC_DOMAIN: ${{ env.QUALIFICATION_RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ env.QUALIFICATION_RPC_PATH_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker compose -f curveyield-anvil/compose.yml up -d --build --no-deps             anvil-01 anvil-02 anvil-03 anvil-04
+
+          for port in 18545 18546 18547 18548; do
+            ready=false
+            for attempt in $(seq 1 120); do
+              chain_id="$(curl -fsS --max-time 3                 -H 'content-type: application/json'                 --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'                 "http://127.0.0.1:$port" | jq -r '.result // empty' || true)"
+              if [ "$chain_id" = "0x1" ]; then
+                ready=true
+                break
+              fi
+              sleep 2
+            done
+            if [ "$ready" != "true" ]; then
+              docker compose -f curveyield-anvil/compose.yml logs --tail=200
+              echo "::error::Anvil on localhost:$port did not become ready"
+              exit 1
+            fi
+          done
+
+      - name: Run Contract-Automation archive probes against every node
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import {pathToFileURL} from 'node:url';
+          import path from 'node:path';
+
+          const root = path.resolve('.contract-automation/packages/github-native-sim/src');
+          const {probeArchiveRpcIdentity} = await import(pathToFileURL(path.join(root, 'archive-rpc-identity-v1.mjs')));
+          const {probeArchiveRpcStateReadiness} = await import(pathToFileURL(path.join(root, 'archive-rpc-state-readiness-v1.mjs')));
+          const {probeArchiveContractCode} = await import(pathToFileURL(path.join(root, 'archive-contract-code-readiness-v1.mjs')));
+
+          const pinnedBlock = 18000000;
+          const weth = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
+
+          for (const port of [18545, 18546, 18547, 18548]) {
+            const rpcUrl = `http://127.0.0.1:${port}`;
+            const identity = await probeArchiveRpcIdentity({rpcUrl, block: pinnedBlock, expectedChainId: 1});
+            if (!identity.chainIdMatchesExpected || !identity.networkIdMatchesExpected || identity.block.number !== pinnedBlock) {
+              throw new Error(`identity/archive probe failed for ${rpcUrl}: ${JSON.stringify(identity)}`);
+            }
+
+            const state = await probeArchiveRpcStateReadiness({rpcUrl, block: pinnedBlock, account: weth});
+            if (state.status !== 'ready') {
+              throw new Error(`historical state probe failed for ${rpcUrl}: ${JSON.stringify(state)}`);
+            }
+
+            const code = await probeArchiveContractCode({rpcUrl, block: pinnedBlock, address: weth});
+            if (code.status !== 'code_present' || code.byteLength <= 0) {
+              throw new Error(`historical code probe failed for ${rpcUrl}: ${JSON.stringify(code)}`);
+            }
+
+            console.log(JSON.stringify({
+              rpc: `localhost:${port}`,
+              chainId: identity.remoteChainId,
+              networkId: identity.remoteNetworkId,
+              pinnedBlock,
+              codeBytes: code.byteLength,
+              state: state.status
+            }));
+          }
+          NODE
+
+      - name: Verify RPC method surface on every node
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rpc() {
+            local port="$1"
+            local method="$2"
+            local params="$3"
+            local payload
+            payload="$(jq -nc --arg method "$method" --argjson params "$params"               '{jsonrpc:"2.0",id:1,method:$method,params:$params}')"
+            curl -fsS --max-time 45               -H 'content-type: application/json'               --data "$payload"               "http://127.0.0.1:$port"
+          }
+
+          pinned=0x112a880
+          weth=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+
+          for port in 18545 18546 18547 18548; do
+            test "$(rpc "$port" eth_chainId '[]' | jq -r '.result')" = "0x1"
+            test "$(rpc "$port" net_version '[]' | jq -r '.result')" = "1"
+
+            latest="$(rpc "$port" eth_blockNumber '[]' | jq -r '.result')"
+            [[ "$latest" =~ ^0x[0-9a-fA-F]+$ ]]
+
+            block_json="$(rpc "$port" eth_getBlockByNumber "[\"$pinned\",false]")"
+            test "$(jq -r '.result.number' <<<"$block_json")" = "$pinned"
+
+            tx="$(jq -r '.result.transactions[0] // empty' <<<"$block_json")"
+            test -n "$tx"
+            test "$(rpc "$port" eth_getTransactionByHash "[\"$tx\"]" | jq -r '.result.hash')" = "$tx"
+            test "$(rpc "$port" eth_getTransactionReceipt "[\"$tx\"]" | jq -r '.result.transactionHash')" = "$tx"
+
+            nonce="$(rpc "$port" eth_getTransactionCount "[\"$weth\",\"$pinned\"]" | jq -r '.result')"
+            [[ "$nonce" =~ ^0x[0-9a-fA-F]+$ ]]
+
+            code="$(rpc "$port" eth_getCode "[\"$weth\",\"$pinned\"]" | jq -r '.result')"
+            test -n "$code"
+            test "$code" != "0x"
+
+            storage="$(rpc "$port" eth_getStorageAt "[\"$weth\",\"0x0\",\"$pinned\"]" | jq -r '.result')"
+            [[ "$storage" =~ ^0x[0-9a-fA-F]{64}$ ]]
+
+            supply="$(rpc "$port" eth_call "[{\"to\":\"$weth\",\"data\":\"0x18160ddd\"},\"$pinned\"]" | jq -r '.result')"
+            [[ "$supply" =~ ^0x[0-9a-fA-F]+$ ]]
+
+            logs_response="$(rpc "$port" eth_getLogs "[{\"address\":\"$weth\",\"fromBlock\":\"latest\",\"toBlock\":\"latest\"}]")"
+            if ! jq -e '.result | arrays' <<<"$logs_response" >/dev/null; then
+              echo "::error::eth_getLogs failed on port $port: $(jq -c '.error // .' <<<"$logs_response")"
+              exit 1
+            fi
+
+            target=0x000000000000000000000000000000000000dEaD
+            rpc "$port" anvil_setBalance "$(jq -nc --arg target "$target" '[$target,"0x123456789"]')" >/dev/null
+            test "$(rpc "$port" eth_getBalance "$(jq -nc --arg target "$target" '[$target,"latest"]')" | jq -r '.result')" = "0x123456789"
+
+            rpc "$port" anvil_impersonateAccount "$(jq -nc --arg target "$target" '[$target]')" >/dev/null
+            rpc "$port" anvil_stopImpersonatingAccount "$(jq -nc --arg target "$target" '[$target]')" >/dev/null
+
+            snapshot="$(rpc "$port" evm_snapshot '[]' | jq -r '.result')"
+            test -n "$snapshot"
+            rpc "$port" anvil_mine '["0x1"]' >/dev/null
+            test "$(rpc "$port" evm_revert "$(jq -nc --arg snapshot "$snapshot" '[$snapshot]')" | jq -r '.result')" = "true"
+          done
+
+          rpc 18545 anvil_dumpState '[]' | jq -e '.result | strings | startswith("0x")' >/dev/null
+
+      - name: Verify graceful persistence on node 01
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ env.QUALIFICATION_SOURCE_RPC }}
+          RPC_DOMAIN: ${{ env.QUALIFICATION_RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ env.QUALIFICATION_RPC_PATH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          rpc() {
+            local method="$1"
+            local params="$2"
+            curl -fsS --max-time 30               -H 'content-type: application/json'               --data "$(jq -nc --arg method "$method" --argjson params "$params" '{jsonrpc:"2.0",id:1,method:$method,params:$params}')"               http://127.0.0.1:18545
+          }
+
+          target=0x000000000000000000000000000000000000dEaD
+          rpc anvil_setBalance "$(jq -nc --arg target "$target" '[$target,"0xabcdef"]')" >/dev/null
+          docker compose -f curveyield-anvil/compose.yml stop -t 45 anvil-01
+          docker compose -f curveyield-anvil/compose.yml start anvil-01
+
+          for attempt in $(seq 1 120); do
+            balance="$(rpc eth_getBalance "$(jq -nc --arg target "$target" '[$target,"latest"]')" 2>/dev/null | jq -r '.result // empty' || true)"
+            if [ "$balance" = "0xabcdef" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker compose -f curveyield-anvil/compose.yml logs --tail=200 anvil-01
+          echo "::error::Node 01 mutation was not restored after graceful restart"
+          exit 1
+
+      - name: Verify corrupt-state quarantine and recovery on node 02
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ env.QUALIFICATION_SOURCE_RPC }}
+          RPC_DOMAIN: ${{ env.QUALIFICATION_RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ env.QUALIFICATION_RPC_PATH_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker compose -f curveyield-anvil/compose.yml stop -t 45 anvil-02
+          docker compose -f curveyield-anvil/compose.yml run --rm --no-deps             --entrypoint /bin/bash anvil-02 -lc             'printf "{broken-state" > /data/state.json'
+          docker compose -f curveyield-anvil/compose.yml start anvil-02
+
+          ready=false
+          for attempt in $(seq 1 120); do
+            chain_id="$(curl -fsS --max-time 3               -H 'content-type: application/json'               --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'               http://127.0.0.1:18546 | jq -r '.result // empty' || true)"
+            if [ "$chain_id" = "0x1" ]; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = "true"
+
+          docker compose -f curveyield-anvil/compose.yml exec -T anvil-02             /bin/bash -lc 'compgen -G "/data/state.json.corrupt.*" >/dev/null'
+
+      - name: Verify nested Anvil fork-source compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker rm -f curveyield-anvil-nested >/dev/null 2>&1 || true
+          docker run -d             --name curveyield-anvil-nested             --network host             -e ETHEREUM_SOURCE_RPC_URL=http://127.0.0.1:18545             -e ANVIL_CHAIN_ID=1             -e ANVIL_PORT=19545             -e ANVIL_ACCOUNTS=20             -e ANVIL_STATE_PATH=/tmp/nested-state.json             curveyield-anvil:qualification >/dev/null
+
+          for attempt in $(seq 1 120); do
+            chain_id="$(curl -fsS --max-time 3               -H 'content-type: application/json'               --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'               http://127.0.0.1:19545 | jq -r '.result // empty' || true)"
+            if [ "$chain_id" = "0x1" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 120 ]; then
+              docker logs curveyield-anvil-nested || true
+              echo "::error::Nested Anvil could not fork from CurveYield node"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          code="$(curl -fsS --max-time 30             -H 'content-type: application/json'             --data '{"jsonrpc":"2.0","id":1,"method":"eth_getCode","params":["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2","0xc5d488"]}'             http://127.0.0.1:19545 | jq -r '.result')"
+          test -n "$code"
+          test "$code" != "0x"
+
+      - name: Show qualified Anvil version
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ env.QUALIFICATION_SOURCE_RPC }}
+          RPC_DOMAIN: ${{ env.QUALIFICATION_RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ env.QUALIFICATION_RPC_PATH_TOKEN }}
+        run: docker compose -f curveyield-anvil/compose.yml exec -T anvil-01 anvil --version
+
+      - name: Cleanup qualification fleet
+        if: always()
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ env.QUALIFICATION_SOURCE_RPC }}
+          RPC_DOMAIN: ${{ env.QUALIFICATION_RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ env.QUALIFICATION_RPC_PATH_TOKEN }}
+        run: |
+          docker rm -f curveyield-anvil-nested >/dev/null 2>&1 || true
+          docker compose -f curveyield-anvil/compose.yml down -v --remove-orphans >/dev/null 2>&1 || true
+
+  deployment-preflight:
+    name: Deployment preflight
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.state.outputs.enabled }}
+    steps:
+      - name: Resolve persistent-host state
+        id: state
+        shell: bash
+        env:
+          ENABLED: ${{ vars.CURVEYIELD_ANVIL_SELF_HOSTED_ENABLED }}
+        run: |
+          if [ "$ENABLED" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Persistent self-hosted deployment is enabled."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Persistent self-hosted deployment is not enabled; qualification remains executable."
+          fi
+
+  deploy:
+    name: Deploy persistent four-node fleet
+    needs:
+      - qualify
+      - deployment-preflight
+    if: github.event_name == 'workflow_dispatch' && needs.deployment-preflight.outputs.enabled == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - curveyield-anvil
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate deployment secrets
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ secrets.ETHEREUM_SOURCE_RPC_URL }}
+          RPC_DOMAIN: ${{ secrets.RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ secrets.RPC_PATH_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$ETHEREUM_SOURCE_RPC_URL" || { echo "::error::ETHEREUM_SOURCE_RPC_URL is required"; exit 1; }
+          test -n "$RPC_DOMAIN" || { echo "::error::RPC_DOMAIN is required"; exit 1; }
+          test -n "$RPC_PATH_TOKEN" || { echo "::error::RPC_PATH_TOKEN is required"; exit 1; }
+          test "${#RPC_PATH_TOKEN}" -ge 32 || { echo "::error::RPC_PATH_TOKEN must be at least 32 characters"; exit 1; }
+
+      - name: Deploy fixed Anvil fleet
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ secrets.ETHEREUM_SOURCE_RPC_URL }}
+          RPC_DOMAIN: ${{ secrets.RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ secrets.RPC_PATH_TOKEN }}
+        run: |
+          set -euo pipefail
+          runtime_env="$(mktemp)"
+          trap 'rm -f "$runtime_env"' EXIT
+          chmod 600 "$runtime_env"
+          {
+            printf 'ETHEREUM_SOURCE_RPC_URL=%s\n' "$ETHEREUM_SOURCE_RPC_URL"
+            printf 'RPC_DOMAIN=%s\n' "$RPC_DOMAIN"
+            printf 'RPC_PATH_TOKEN=%s\n' "$RPC_PATH_TOKEN"
+          } >"$runtime_env"
+
+          docker compose --env-file "$runtime_env" -f curveyield-anvil/compose.yml up -d --build --remove-orphans
+
+          for service in anvil-01 anvil-02 anvil-03 anvil-04; do
+            for attempt in $(seq 1 150); do
+              if docker compose --env-file "$runtime_env" -f curveyield-anvil/compose.yml exec -T "$service"                 /usr/local/bin/curveyield-anvil-healthcheck >/dev/null 2>&1; then
+                break
+              fi
+              if [ "$attempt" -eq 150 ]; then
+                docker compose --env-file "$runtime_env" -f curveyield-anvil/compose.yml logs --tail=200 "$service"
+                echo "::error::$service did not become healthy"
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+
+          for node in ethereum-01 ethereum-02 ethereum-03 ethereum-04; do
+            response="$(curl -fsS --max-time 30               -H 'content-type: application/json'               --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'               "https://${RPC_DOMAIN}/${RPC_PATH_TOKEN}/${node}")"
+            test "$(jq -r '.result' <<<"$response")" = "0x1"
+          done
+
+      - name: Deployment result
+        shell: bash
+        env:
+          RPC_DOMAIN: ${{ secrets.RPC_DOMAIN }}
+        run: |
+          echo "CurveYield persistent four-node Anvil fleet is healthy at the configured secret-path HTTPS endpoints on $RPC_DOMAIN."
