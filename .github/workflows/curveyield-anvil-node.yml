@@ -177,7 +177,11 @@ jobs:
             supply="$(rpc "$port" eth_call "[{\"to\":\"$weth\",\"data\":\"0x18160ddd\"},\"$pinned\"]" | jq -r '.result')"
             [[ "$supply" =~ ^0x[0-9a-fA-F]+$ ]]
 
-            rpc "$port" eth_getLogs "[{\"address\":\"$weth\",\"fromBlock\":\"$pinned\",\"toBlock\":\"$pinned\"}]"               | jq -e '.result | arrays' >/dev/null
+            logs_response="$(rpc "$port" eth_getLogs "[{\"address\":\"$weth\",\"fromBlock\":\"latest\",\"toBlock\":\"latest\"}]")"
+            if ! jq -e '.result | arrays' <<<"$logs_response" >/dev/null; then
+              echo "::error::eth_getLogs failed on port $port: $(jq -c '.error // .' <<<"$logs_response")"
+              exit 1
+            fi
 
             target=0x000000000000000000000000000000000000dEaD
             rpc "$port" anvil_setBalance "$(jq -nc --arg target "$target" '[$target,"0x123456789"]')" >/dev/null
