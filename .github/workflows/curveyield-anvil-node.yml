@@ -101,7 +101,7 @@ jobs:
           const {probeArchiveRpcStateReadiness} = await import(pathToFileURL(path.join(root, 'archive-rpc-state-readiness-v1.mjs')));
           const {probeArchiveContractCode} = await import(pathToFileURL(path.join(root, 'archive-contract-code-readiness-v1.mjs')));
 
-          const pinnedBlock = 12965000;
+          const pinnedBlock = 18000000;
           const weth = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
 
           for (const port of [18545, 18546, 18547, 18548]) {
@@ -146,7 +146,7 @@ jobs:
             curl -fsS --max-time 45               -H 'content-type: application/json'               --data "$payload"               "http://127.0.0.1:$port"
           }
 
-          pinned=0xc5d488
+          pinned=0x112a880
           weth=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
 
           for port in 18545 18546 18547 18548; do
