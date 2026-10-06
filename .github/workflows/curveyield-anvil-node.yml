@@ -24,14 +24,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout Contract-Automation compatibility probes
-        uses: actions/checkout@v4
-        with:
-          repository: CurveYield2/Contract-Automation
-          ref: main
-          path: .contract-automation
-          persist-credentials: false
-
       - name: Validate Compose
         shell: bash
         env:
@@ -113,38 +105,51 @@ jobs:
           test -n "$weth_code"
           test "$weth_code" != "0x"
 
-          cat >/tmp/contract-automation-rpc-compat.mjs <<'NODE'
-          import {pathToFileURL} from 'node:url';
-          import path from 'node:path';
+          # Contract-Automation Phase-0 consumes the configured RPC as the fork source
+          # for another local Anvil. Prove that exact nested-fork behavior here.
+          docker rm -f curveyield-anvil-nested >/dev/null 2>&1 || true
+          docker run -d \
+            --name curveyield-anvil-nested \
+            --network host \
+            --entrypoint anvil \
+            curveyield-anvil:qualification \
+            --host 127.0.0.1 \
+            --port 18546 \
+            --chain-id 1 \
+            --fork-url http://127.0.0.1:18545 \
+            --accounts 2 \
+            --auto-impersonate \
+            --no-rate-limit \
+            --silent >/dev/null
 
-          const root=process.cwd();
-          const moduleUrl=rel=>pathToFileURL(path.join(root,'.contract-automation',rel)).href;
-          const {probeArchiveRpcIdentity}=await import(moduleUrl('packages/github-native-sim/src/archive-rpc-identity-v1.mjs'));
-          const {probeArchiveRpcStateReadiness}=await import(moduleUrl('packages/github-native-sim/src/archive-rpc-state-readiness-v1.mjs'));
-          const {probeArchiveContractCode}=await import(moduleUrl('packages/github-native-sim/src/archive-contract-code-readiness-v1.mjs'));
-
-          const rpcUrl='http://127.0.0.1:18545';
-          const block=0xc5d488;
-          const weth='0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc';
-
-          const identity=await probeArchiveRpcIdentity({rpcUrl,block,expectedChainId:1});
-          if(!identity.chainIdMatchesExpected || !identity.networkIdMatchesExpected) {
-            throw new Error('Contract-Automation archive identity probe failed');
+          nested_rpc() {
+            local method="$1"
+            local params="$2"
+            local payload
+            payload="$(jq -nc --arg method "$method" --argjson params "$params" '{jsonrpc:"2.0",id:1,method:$method,params:$params}')"
+            curl -fsS --max-time 30 \
+              -H 'content-type: application/json' \
+              --data "$payload" \
+              http://127.0.0.1:18546
           }
 
-          const state=await probeArchiveRpcStateReadiness({rpcUrl,block,account:weth});
-          if(state.status!=='ready') throw new Error('Contract-Automation historical state probe failed: '+JSON.stringify(state));
+          for attempt in $(seq 1 90); do
+            nested_chain="$(nested_rpc eth_chainId '[]' 2>/dev/null | jq -r '.result // empty' || true)"
+            if [ "$nested_chain" = "0x1" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              docker logs curveyield-anvil-nested || true
+              echo "::error::Contract-Automation-style nested Anvil fork did not become ready"
+              exit 1
+            fi
+            sleep 2
+          done
 
-          const code=await probeArchiveContractCode({rpcUrl,block,address:weth});
-          if(code.status!=='code_present') throw new Error('Contract-Automation historical code probe failed: '+JSON.stringify(code));
-
-          console.log(JSON.stringify({
-            identity:{chainId:identity.remoteChainId,networkId:identity.remoteNetworkId,block:identity.block.number},
-            state:{status:state.status,block:state.block},
-            code:{status:code.status,block:code.block,byteLength:code.byteLength}
-          }));
-          NODE
-          node /tmp/contract-automation-rpc-compat.mjs
+          nested_weth_code="$(nested_rpc eth_getCode '["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc","latest"]' | jq -r '.result')"
+          test -n "$nested_weth_code"
+          test "$nested_weth_code" != "0x"
+          docker rm -f curveyield-anvil-nested >/dev/null
 
           target=0x000000000000000000000000000000000000dEaD
           rpc anvil_setBalance "$(jq -nc --arg target "$target" '[$target,"0x123456789"]')" >/dev/null
@@ -173,6 +178,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+          docker rm -f curveyield-anvil-nested >/dev/null 2>&1 || true
           docker rm -f curveyield-anvil-qualification >/dev/null 2>&1 || true
           docker volume rm curveyield-anvil-qualification-state >/dev/null 2>&1 || true
 
