@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  QUALIFICATION_SOURCE_RPC: https://ethereum-rpc.publicnode.com
+  QUALIFICATION_SOURCE_RPC: https://eth.drpc.org/
   QUALIFICATION_RPC_DOMAIN: rpc.example.invalid
   QUALIFICATION_RPC_PATH_TOKEN: qualification-only-token
   COMPOSE_PROJECT_NAME: curveyield-anvil-qualification
