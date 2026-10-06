@@ -1,0 +1,232 @@
+name: CurveYield Anvil Node
+
+on:
+  push:
+    branches:
+      - agent/curveyield-anvil-node-deployment
+    paths:
+      - 'curveyield-anvil/**'
+      - '.github/workflows/curveyield-anvil-node.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'curveyield-anvil/**'
+      - '.github/workflows/curveyield-anvil-node.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: curveyield-anvil-node-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    name: Qualify persistent Anvil image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Compose
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: https://ethereum-rpc.publicnode.com
+          RPC_DOMAIN: rpc.example.invalid
+          RPC_PATH_TOKEN: qualification-only-token
+        run: |
+          set -euo pipefail
+          docker compose -f curveyield-anvil/compose.yml config >/tmp/curveyield-anvil-compose.yml
+
+      - name: Build minimal Anvil image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t curveyield-anvil:qualification curveyield-anvil
+
+      - name: Start disposable fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker volume rm curveyield-anvil-qualification-state >/dev/null 2>&1 || true
+          docker volume create curveyield-anvil-qualification-state >/dev/null
+          docker run -d \
+            --name curveyield-anvil-qualification \
+            -p 127.0.0.1:18545:8545 \
+            -e ETHEREUM_SOURCE_RPC_URL=https://ethereum-rpc.publicnode.com \
+            -e ANVIL_CHAIN_ID=1 \
+            -e ANVIL_PORT=8545 \
+            -e ANVIL_ACCOUNTS=20 \
+            -e ANVIL_STATE_PATH=/data/state.json \
+            -v curveyield-anvil-qualification-state:/data \
+            curveyield-anvil:qualification >/dev/null
+
+          for attempt in $(seq 1 90); do
+            chain_id="$(curl -fsS --max-time 3 \
+              -H 'content-type: application/json' \
+              --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
+              http://127.0.0.1:18545 | jq -r '.result // empty' || true)"
+            if [ "$chain_id" = "0x1" ]; then
+              exit 0
+            fi
+            if ! docker inspect curveyield-anvil-qualification >/dev/null 2>&1; then
+              echo "::error::Qualification container disappeared"
+              exit 1
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' curveyield-anvil-qualification)" != "true" ]; then
+              docker logs curveyield-anvil-qualification || true
+              exit 1
+            fi
+            sleep 2
+          done
+          docker logs curveyield-anvil-qualification || true
+          echo "::error::Anvil readiness timeout"
+          exit 1
+
+      - name: Verify identity, archive reads, mutability and persistence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rpc() {
+            local method="$1"
+            local params="$2"
+            curl -fsS --max-time 30 \
+              -H 'content-type: application/json' \
+              --data "{"jsonrpc":"2.0","id":1,"method":"$method","params":$params}" \
+              http://127.0.0.1:18545
+          }
+
+          test "$(rpc eth_chainId '[]' | jq -r '.result')" = "0x1"
+          test "$(rpc net_version '[]' | jq -r '.result')" = "1"
+
+          block="$(rpc eth_blockNumber '[]' | jq -r '.result')"
+          [[ "$block" =~ ^0x[0-9a-fA-F]+$ ]]
+
+          weth_code="$(rpc eth_getCode '["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc","0xc5d488"]' | jq -r '.result')"
+          test -n "$weth_code"
+          test "$weth_code" != "0x"
+
+          target=0x000000000000000000000000000000000000dEaD
+          rpc anvil_setBalance "["$target","0x123456789"]" >/dev/null
+          test "$(rpc eth_getBalance "["$target","latest"]" | jq -r '.result')" = "0x123456789"
+
+          docker stop --time 45 curveyield-anvil-qualification >/dev/null
+          docker start curveyield-anvil-qualification >/dev/null
+
+          for attempt in $(seq 1 90); do
+            balance="$(rpc eth_getBalance "["$target","latest"]" 2>/dev/null | jq -r '.result // empty' || true)"
+            if [ "$balance" = "0x123456789" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs curveyield-anvil-qualification || true
+          echo "::error::Persisted mutation was not restored after restart"
+          exit 1
+
+      - name: Show qualified Anvil version
+        shell: bash
+        run: docker exec curveyield-anvil-qualification anvil --version
+
+      - name: Cleanup qualification node
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f curveyield-anvil-qualification >/dev/null 2>&1 || true
+          docker volume rm curveyield-anvil-qualification-state >/dev/null 2>&1 || true
+
+  deployment-preflight:
+    name: Deployment preflight
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.state.outputs.enabled }}
+    steps:
+      - name: Resolve persistent-host state
+        id: state
+        shell: bash
+        env:
+          ENABLED: ${{ vars.CURVEYIELD_ANVIL_SELF_HOSTED_ENABLED }}
+        run: |
+          if [ "$ENABLED" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Persistent self-hosted deployment is enabled."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Persistent self-hosted deployment is not enabled; qualification remains executable."
+          fi
+
+  deploy:
+    name: Deploy persistent node
+    needs:
+      - qualify
+      - deployment-preflight
+    if: github.event_name == 'workflow_dispatch' && needs.deployment-preflight.outputs.enabled == 'true'
+    runs-on:
+      - self-hosted
+      - linux
+      - curveyield-anvil
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate deployment secrets
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ secrets.ETHEREUM_SOURCE_RPC_URL }}
+          RPC_DOMAIN: ${{ secrets.RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ secrets.RPC_PATH_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$ETHEREUM_SOURCE_RPC_URL" || { echo "::error::ETHEREUM_SOURCE_RPC_URL is required"; exit 1; }
+          test -n "$RPC_DOMAIN" || { echo "::error::RPC_DOMAIN is required"; exit 1; }
+          test -n "$RPC_PATH_TOKEN" || { echo "::error::RPC_PATH_TOKEN is required"; exit 1; }
+          test "${#RPC_PATH_TOKEN}" -ge 32 || { echo "::error::RPC_PATH_TOKEN must be at least 32 characters"; exit 1; }
+
+      - name: Deploy fixed Anvil service
+        shell: bash
+        env:
+          ETHEREUM_SOURCE_RPC_URL: ${{ secrets.ETHEREUM_SOURCE_RPC_URL }}
+          RPC_DOMAIN: ${{ secrets.RPC_DOMAIN }}
+          RPC_PATH_TOKEN: ${{ secrets.RPC_PATH_TOKEN }}
+        run: |
+          set -euo pipefail
+          runtime_env="$(mktemp)"
+          trap 'rm -f "$runtime_env"' EXIT
+          chmod 600 "$runtime_env"
+          {
+            printf 'ETHEREUM_SOURCE_RPC_URL=%s\n' "$ETHEREUM_SOURCE_RPC_URL"
+            printf 'RPC_DOMAIN=%s\n' "$RPC_DOMAIN"
+            printf 'RPC_PATH_TOKEN=%s\n' "$RPC_PATH_TOKEN"
+          } >"$runtime_env"
+
+          docker compose --env-file "$runtime_env" -f curveyield-anvil/compose.yml up -d --build --remove-orphans
+
+          for attempt in $(seq 1 90); do
+            if docker compose --env-file "$runtime_env" -f curveyield-anvil/compose.yml exec -T anvil \
+              /usr/local/bin/curveyield-anvil-healthcheck >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              docker compose --env-file "$runtime_env" -f curveyield-anvil/compose.yml logs --tail=200 anvil
+              echo "::error::Persistent Anvil did not become healthy"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          response="$(curl -fsS --max-time 15 \
+            -H 'content-type: application/json' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
+            "https://${RPC_DOMAIN}/${RPC_PATH_TOKEN}")"
+          test "$(jq -r '.result' <<<"$response")" = "0x1"
+
+      - name: Deployment result
+        shell: bash
+        env:
+          RPC_DOMAIN: ${{ secrets.RPC_DOMAIN }}
+        run: |
+          echo "CurveYield persistent Anvil is healthy at the configured secret-path HTTPS endpoint on $RPC_DOMAIN."

@@ -1,0 +1,45 @@
+services:
+  anvil:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      ETHEREUM_SOURCE_RPC_URL: ${ETHEREUM_SOURCE_RPC_URL:?ETHEREUM_SOURCE_RPC_URL is required}
+      ANVIL_CHAIN_ID: "1"
+      ANVIL_PORT: "8545"
+      ANVIL_ACCOUNTS: "20"
+      ANVIL_STATE_PATH: "/data/state.json"
+    expose:
+      - "8545"
+    volumes:
+      - anvil_state:/data
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/curveyield-anvil-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      anvil:
+        condition: service_healthy
+    environment:
+      RPC_DOMAIN: ${RPC_DOMAIN:?RPC_DOMAIN is required}
+      RPC_PATH_TOKEN: ${RPC_PATH_TOKEN:?RPC_PATH_TOKEN is required}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  anvil_state:
+  caddy_data:
+  caddy_config:

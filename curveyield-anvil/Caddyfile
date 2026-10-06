@@ -1,0 +1,13 @@
+{$RPC_DOMAIN} {
+	handle_path /{$RPC_PATH_TOKEN}* {
+		reverse_proxy anvil:8545 {
+			transport http {
+				dial_timeout 30s
+				read_timeout 10m
+				write_timeout 10m
+			}
+		}
+	}
+
+	respond 404
+}
