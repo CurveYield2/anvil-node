@@ -24,6 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout Contract-Automation compatibility probes
+        uses: actions/checkout@v4
+        with:
+          repository: CurveYield2/Contract-Automation
+          ref: main
+          path: .contract-automation
+          persist-credentials: false
+
       - name: Validate Compose
         shell: bash
         env:
@@ -104,6 +112,34 @@ jobs:
           weth_code="$(rpc eth_getCode '["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc","0xc5d488"]' | jq -r '.result')"
           test -n "$weth_code"
           test "$weth_code" != "0x"
+
+          cat >/tmp/contract-automation-rpc-compat.mjs <<'NODE'
+          import {probeArchiveRpcIdentity} from process.cwd() + '/.contract-automation/packages/github-native-sim/src/archive-rpc-identity-v1.mjs';
+          import {probeArchiveRpcStateReadiness} from process.cwd() + '/.contract-automation/packages/github-native-sim/src/archive-rpc-state-readiness-v1.mjs';
+          import {probeArchiveContractCode} from process.cwd() + '/.contract-automation/packages/github-native-sim/src/archive-contract-code-readiness-v1.mjs';
+
+          const rpcUrl='http://127.0.0.1:18545';
+          const block=0xc5d488;
+          const weth='0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc';
+
+          const identity=await probeArchiveRpcIdentity({rpcUrl,block,expectedChainId:1});
+          if(!identity.chainIdMatchesExpected || !identity.networkIdMatchesExpected) {
+            throw new Error('Contract-Automation archive identity probe failed');
+          }
+
+          const state=await probeArchiveRpcStateReadiness({rpcUrl,block,account:weth});
+          if(state.status!=='ready') throw new Error('Contract-Automation historical state probe failed: '+JSON.stringify(state));
+
+          const code=await probeArchiveContractCode({rpcUrl,block,address:weth});
+          if(code.status!=='code_present') throw new Error('Contract-Automation historical code probe failed: '+JSON.stringify(code));
+
+          console.log(JSON.stringify({
+            identity:{chainId:identity.remoteChainId,networkId:identity.remoteNetworkId,block:identity.block.number},
+            state:{status:state.status,block:state.block},
+            code:{status:code.status,block:code.block,byteLength:code.byteLength}
+          }));
+          NODE
+          node /tmp/contract-automation-rpc-compat.mjs
 
           target=0x000000000000000000000000000000000000dEaD
           rpc anvil_setBalance "$(jq -nc --arg target "$target" '[$target,"0x123456789"]')" >/dev/null
