@@ -1,4 +1,4 @@
-FROM ghcr.io/foundry-rs/foundry:stable
+FROM ghcr.io/foundry-rs/foundry:v1.5.1
 
 USER root
 
