@@ -114,9 +114,14 @@ jobs:
           test "$weth_code" != "0x"
 
           cat >/tmp/contract-automation-rpc-compat.mjs <<'NODE'
-          import {probeArchiveRpcIdentity} from process.cwd() + '/.contract-automation/packages/github-native-sim/src/archive-rpc-identity-v1.mjs';
-          import {probeArchiveRpcStateReadiness} from process.cwd() + '/.contract-automation/packages/github-native-sim/src/archive-rpc-state-readiness-v1.mjs';
-          import {probeArchiveContractCode} from process.cwd() + '/.contract-automation/packages/github-native-sim/src/archive-contract-code-readiness-v1.mjs';
+          import {pathToFileURL} from 'node:url';
+          import path from 'node:path';
+
+          const root=process.cwd();
+          const moduleUrl=rel=>pathToFileURL(path.join(root,'.contract-automation',rel)).href;
+          const {probeArchiveRpcIdentity}=await import(moduleUrl('packages/github-native-sim/src/archive-rpc-identity-v1.mjs'));
+          const {probeArchiveRpcStateReadiness}=await import(moduleUrl('packages/github-native-sim/src/archive-rpc-state-readiness-v1.mjs'));
+          const {probeArchiveContractCode}=await import(moduleUrl('packages/github-native-sim/src/archive-contract-code-readiness-v1.mjs'));
 
           const rpcUrl='http://127.0.0.1:18545';
           const block=0xc5d488;
