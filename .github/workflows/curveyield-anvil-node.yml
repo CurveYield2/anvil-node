@@ -1,12 +1,6 @@
 name: CurveYield Anvil Node
 
 on:
-  push:
-    branches:
-      - agent/curveyield-anvil-node-deployment
-    paths:
-      - 'curveyield-anvil/**'
-      - '.github/workflows/curveyield-anvil-node.yml'
   pull_request:
     branches:
       - main
